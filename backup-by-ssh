@@ -1,0 +1,66 @@
+#!/bin/bash
+function exiterr(){ notify-send -t 8640000 'Backup Script Failed' "${1}"; exit 1; }
+function localsum(){ sha512sum "${1}" | grep -oe '[0-9a-f]\{128\}' || exiterr "Unable to get sha512sum for local file ${1##*/}"; }
+function remotesum(){ $sshcmd "sha512sum ${remotebkp}${1}" | grep -oe '[0-9a-f]\{128\}' || exiterr "Unable to get sha512sum for remote file ${1}"; }
+
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+export DISPLAY=:0
+
+failssh=0
+server='user@server'
+gpgrecipient='user@email'
+remotebkp='/path/to/remote/dir/'
+localbkp='/path/to/local/dir/'
+sshcmd="ssh -o BatchMode=yes -o ConnectionAttempts=3 -o ConnectTimeout=2 ${server}"
+
+until $sshcmd 'true' >&/dev/null; do
+    ((++failssh >= 30)) && exiterr "Cannot establish SSH connection to ${server}"
+    sleep 1
+done
+
+uploaded=()
+declare -A bkpfiles=(
+    ["${HOME}/folder1.tar.gz.gpg"]="${HOME}/folder1"
+    ["${HOME}/folder2.tar.gz.gpg"]="${HOME}/folder2"
+    ["${HOME}/Documents/password-db.kdbx"]=''
+)
+
+for bfile in "${!bkpfiles[@]}"; do
+    dirnewer=false
+    bkpdir="${bkpfiles[$bfile]}"
+    
+    if [[ -d "${bkpdir}" ]]; then
+        for f in "${bkpdir}"/*; do
+            [[ "$f" -nt "${HOME}/${bkpdir##*/}-last-modified" ]] && dirnewer=true
+        done
+        
+        if $dirnewer; then
+            tarf="${bfile%.gpg}"
+            tar Pczf "${tarf}" "${bkpdir}" || exiterr "Error archiving ${tarf}"
+            gpg --batch --yes --output "${bfile}" --encrypt --recipient "${gpgrecipient}" "${tarf}" || exiterr "Error encrypting ${tarf}"
+            rm -f "${tarf}"
+            touch "${HOME}/${bkpdir##*/}-last-modified"
+        fi
+    fi
+    
+    lsha512="$(localsum "${bfile}")"
+    rsha512="$(remotesum "${bfile##*/}")"
+    
+    if [[ "${lsha512}" != "${rsha512}" ]]; then
+        lsize="$(stat -c%s "${bfile}")"
+        rsize="$($sshcmd "stat -c%s ${remotebkp}${bfile##*/}")"
+        ((lsize < rsize)) && exiterr "Local ${bfile##*/} filesize smaller (manual backup required)"
+        
+        scp -l 8000 -o BatchMode=yes "${bfile}" "${server}:${remotebkp}" || exiterr "Error copying ${bfile##*/} to ${server}"
+        [[ -d "${localbkp}" ]] && cp "${bfile}" "${localbkp}"
+        
+        uploaded+=("${bfile##*/}")
+    fi
+done
+
+if [[ -z "${uploaded[*]}" ]]; then
+    notify-send -t 8640000 'Backup Script Successful' 'No uploads were needed'
+else
+    IFS=$'\n'
+    notify-send -t 8640000 'Backup Script Successful' "Successfully uploaded files:\\n${uploaded[*]}"
+fi
